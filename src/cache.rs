@@ -34,27 +34,35 @@ pub struct Refreshed {
 ///
 /// `last` is the caller's in-memory snapshot. It is used when newer than the
 /// cache, so a pane that cannot use the cache still throttles its fetches.
-pub fn refresh<C, X>(
+///
+/// `clock` is read once the lock is held, so the calls it serialises see
+/// increasing times.
+pub fn refresh<N, C, X>(
     path: &Path,
-    now: DateTime<Utc>,
+    clock: N,
     mode: Mode,
     last: Snapshot,
     fetch_claude: C,
     fetch_codex: X,
 ) -> Refreshed
 where
+    N: FnOnce() -> DateTime<Utc>,
     C: FnOnce() -> Result<Usage> + Send,
     X: FnOnce() -> Result<Usage>,
 {
     // Held until the new snapshot is saved.
     let lock = lock(path);
+    let now = clock();
 
     // A missing or corrupt cache just means "fetch now".
     let cached: Snapshot = fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    let mut snap = if last.attempted_at > cached.attempted_at {
+    // A time in the future (the clock stepped back) would block fetching until
+    // the clock caught up, so it counts as never attempted.
+    let attempted = |s: &Snapshot| s.attempted_at.filter(|&t| t <= now);
+    let mut snap = if attempted(&last) > attempted(&cached) {
         last
     } else {
         cached
@@ -64,7 +72,7 @@ where
         Mode::Auto => AUTO_TTL,
         Mode::Manual => MANUAL_FLOOR,
     };
-    if snap.attempted_at.is_some_and(|t| now - t < min_age) {
+    if attempted(&snap).is_some_and(|t| now - t < min_age) {
         return Refreshed {
             snapshot: snap,
             cache_error: lock.err(),
@@ -151,7 +159,7 @@ mod tests {
         let count = || calls.fetch_add(1, Ordering::Relaxed);
         let refreshed = refresh(
             path,
-            now,
+            || now,
             mode,
             last,
             || {
@@ -294,6 +302,57 @@ mod tests {
         );
         assert_eq!(calls, 0);
         assert_eq!(refreshed.snapshot.claude.usage, Some(usage(1.0)));
+    }
+
+    #[test]
+    fn future_attempt_does_not_block_fetching() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        // Written before the clock stepped back a day.
+        let future = t0() + Duration::days(1);
+        run(&path, future, Mode::Auto, Ok(usage(1.0)), Ok(usage(1.0)));
+
+        let (snap, calls) = run(&path, t0(), Mode::Auto, Ok(usage(2.0)), Ok(usage(2.0)));
+        assert_eq!(calls, 2);
+        assert_eq!(snap.claude.usage, Some(usage(2.0)));
+        assert_eq!(snap.attempted_at, Some(t0()));
+    }
+
+    #[test]
+    fn future_cache_with_failed_save_throttles_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        run(
+            &path,
+            t0() + Duration::days(1),
+            Mode::Auto,
+            Ok(usage(1.0)),
+            Ok(usage(1.0)),
+        );
+        // The future snapshot stays in the cache: saves fail from now on.
+        fs::create_dir(path.with_extension("tmp")).unwrap();
+
+        let (refreshed, calls) = run_with(
+            &path,
+            t0(),
+            Mode::Auto,
+            Snapshot::default(),
+            Ok(usage(2.0)),
+            Ok(usage(2.0)),
+        );
+        assert_eq!(calls, 2);
+        assert!(refreshed.cache_error.is_some());
+
+        let (refreshed, calls) = run_with(
+            &path,
+            t0() + Duration::seconds(1),
+            Mode::Manual,
+            refreshed.snapshot,
+            Ok(usage(3.0)),
+            Ok(usage(3.0)),
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(refreshed.snapshot.claude.usage, Some(usage(2.0)));
     }
 
     #[test]

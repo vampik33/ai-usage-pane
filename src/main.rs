@@ -1,6 +1,8 @@
 mod cache;
 mod claude;
 mod codex;
+#[cfg(test)]
+mod conformance;
 mod format;
 mod http;
 mod model;

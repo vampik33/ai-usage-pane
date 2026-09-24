@@ -53,13 +53,25 @@ pub fn parse(body: &str) -> Result<Usage> {
             used_percent: w.used_percent,
             resets_at: Some(w.reset_at),
         };
-        match w.limit_window_seconds {
-            FIVE_HOURS_SECS => usage.five_hour = Some(window),
-            WEEK_SECS => usage.weekly = Some(window),
-            _ => {}
+        let slot = match w.limit_window_seconds {
+            FIVE_HOURS_SECS => &mut usage.five_hour,
+            WEEK_SECS => &mut usage.weekly,
+            _ => continue,
+        };
+        // Two windows of one length: show the more used one, whatever the order.
+        if slot.as_ref().is_none_or(|old| more_used(&window, old)) {
+            *slot = Some(window);
         }
     }
     Ok(usage)
+}
+
+/// A strict total order, so that picking the larger window is order-independent.
+fn more_used(a: &Window, b: &Window) -> bool {
+    a.used_percent
+        .total_cmp(&b.used_percent)
+        .then(a.resets_at.cmp(&b.resets_at))
+        .is_gt()
 }
 
 pub fn fetch(home: &Path) -> Result<Usage> {
@@ -108,6 +120,22 @@ mod tests {
         let u = parse(body).unwrap();
         assert_eq!(u.five_hour.unwrap().used_percent, 28.0);
         assert_eq!(u.weekly.unwrap().used_percent, 79.0);
+    }
+
+    #[test]
+    fn same_length_windows_keep_the_more_used() {
+        let body = |a: u32, b: u32| {
+            format!(
+                r#"{{"rate_limit":{{
+                "primary_window":{{"used_percent":{a},"limit_window_seconds":18000,"reset_at":1}},
+                "secondary_window":{{"used_percent":{b},"limit_window_seconds":18000,"reset_at":2}}}}}}"#
+            )
+        };
+        for (a, b) in [(28, 11), (11, 28)] {
+            let u = parse(&body(a, b)).unwrap();
+            assert_eq!(u.five_hour.unwrap().used_percent, 28.0);
+            assert_eq!(u.weekly, None);
+        }
     }
 
     #[test]

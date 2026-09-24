@@ -1,0 +1,10 @@
+name = "verify"
+defaultTargets = ["AiUsagePane", "gen"]
+
+[[lean_lib]]
+name = "AiUsagePane"
+
+# Writes the conformance vectors checked by `src/conformance.rs`.
+[[lean_exe]]
+name = "gen"
+root = "Main"

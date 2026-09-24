@@ -23,6 +23,9 @@ Codex  5h ░░░░░░░░░░   0% ↻4h59m  │ wk █████�
 
 > The usage endpoints are undocumented and may change without notice.
 
+The throttling, formatting and parsing logic is modelled and proved in Lean 4; see
+[`verify/`](verify/README.md).
+
 ## Install
 
 ```sh

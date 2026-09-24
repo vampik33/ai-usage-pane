@@ -113,13 +113,12 @@ impl App {
         let (tx, home, path) = (self.tx.clone(), self.home.clone(), self.cache_path.clone());
         let last = self.snapshot.clone();
         thread::spawn(move || {
-            let now = Utc::now();
             let result = cache::refresh(
                 &path,
-                now,
+                Utc::now,
                 mode,
                 last,
-                || claude::fetch(&home, now),
+                || claude::fetch(&home, Utc::now()),
                 || codex::fetch(&home),
             );
             let _ = tx.send(result);
