@@ -20,17 +20,15 @@ pub struct Usage {
 pub struct ProviderState {
     /// Last successfully fetched usage; kept when a later fetch fails.
     pub usage: Option<Usage>,
-    pub updated_at: Option<DateTime<Utc>>,
     /// Error from the most recent fetch, if it failed.
     pub error: Option<String>,
 }
 
 impl ProviderState {
-    pub fn apply(&mut self, result: anyhow::Result<Usage>, now: DateTime<Utc>) {
+    pub fn apply(&mut self, result: anyhow::Result<Usage>) {
         match result {
             Ok(usage) => {
                 self.usage = Some(usage);
-                self.updated_at = Some(now);
                 self.error = None;
             }
             Err(e) => self.error = Some(e.to_string()),

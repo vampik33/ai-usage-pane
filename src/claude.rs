@@ -16,12 +16,11 @@ struct Credentials {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OAuth {
-    #[serde(rename = "accessToken")]
     access_token: String,
-    /// Unix milliseconds.
-    #[serde(rename = "expiresAt")]
-    expires_at: i64,
+    #[serde(with = "chrono::serde::ts_milliseconds")]
+    expires_at: DateTime<Utc>,
 }
 
 #[derive(Deserialize)]
@@ -50,7 +49,7 @@ impl From<RawWindow> for Window {
 pub fn access_token(credentials_json: &str, now: DateTime<Utc>) -> Result<String> {
     let creds: Credentials =
         serde_json::from_str(credentials_json).context("bad credentials file")?;
-    if now.timestamp_millis() >= creds.oauth.expires_at {
+    if now >= creds.oauth.expires_at {
         bail!(EXPIRED);
     }
     Ok(creds.oauth.access_token)

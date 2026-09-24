@@ -2,6 +2,7 @@
 
 use std::fs::{self, File};
 use std::path::Path;
+use std::thread;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -20,15 +21,11 @@ pub enum Mode {
     Manual,
 }
 
-pub struct Fetchers<C, X> {
-    pub claude: C,
-    pub codex: X,
-}
-
 pub struct Refreshed {
     pub snapshot: Snapshot,
-    /// Writing the cache failed; `snapshot` is still current, just not shared.
-    pub save_error: Option<anyhow::Error>,
+    /// The cache could not be locked or written; `snapshot` is still current,
+    /// just not shared with other panes.
+    pub cache_error: Option<anyhow::Error>,
 }
 
 /// Returns the cached snapshot, fetching first if it is older than the
@@ -36,23 +33,21 @@ pub struct Refreshed {
 /// ones that wait pick up the snapshot the first one just wrote.
 ///
 /// `last` is the caller's in-memory snapshot. It is used when newer than the
-/// cache, so a pane that cannot write the cache still throttles its fetches.
+/// cache, so a pane that cannot use the cache still throttles its fetches.
 pub fn refresh<C, X>(
     path: &Path,
     now: DateTime<Utc>,
     mode: Mode,
     last: Snapshot,
-    fetchers: Fetchers<C, X>,
-) -> Result<Refreshed>
+    fetch_claude: C,
+    fetch_codex: X,
+) -> Refreshed
 where
-    C: FnOnce() -> Result<Usage>,
+    C: FnOnce() -> Result<Usage> + Send,
     X: FnOnce() -> Result<Usage>,
 {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    }
-    let lock = File::create(path.with_extension("lock")).context("create lock file")?;
-    lock.lock().context("lock cache")?;
+    // Held until the new snapshot is saved.
+    let lock = lock(path);
 
     // A missing or corrupt cache just means "fetch now".
     let cached: Snapshot = fs::read_to_string(path)
@@ -70,20 +65,35 @@ where
         Mode::Manual => MANUAL_FLOOR,
     };
     if snap.attempted_at.is_some_and(|t| now - t < min_age) {
-        return Ok(Refreshed {
+        return Refreshed {
             snapshot: snap,
-            save_error: None,
-        });
+            cache_error: lock.err(),
+        };
     }
 
-    snap.claude.apply((fetchers.claude)(), now);
-    snap.codex.apply((fetchers.codex)(), now);
+    // Independent endpoints: fetch both at once to halve the time the lock is held.
+    let (claude, codex) = thread::scope(|s| {
+        let claude = s.spawn(fetch_claude);
+        let codex = fetch_codex();
+        (claude.join().expect("claude fetch panicked"), codex)
+    });
+    snap.claude.apply(claude);
+    snap.codex.apply(codex);
     snap.attempted_at = Some(now);
 
-    Ok(Refreshed {
-        save_error: save(path, &snap).err(),
+    Refreshed {
+        cache_error: lock.and_then(|_lock| save(path, &snap)).err(),
         snapshot: snap,
-    })
+    }
+}
+
+fn lock(path: &Path) -> Result<File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let lock = File::create(path.with_extension("lock")).context("create lock file")?;
+    lock.lock().context("lock cache")?;
+    Ok(lock)
 }
 
 fn save(path: &Path, snap: &Snapshot) -> Result<()> {
@@ -99,7 +109,7 @@ mod tests {
     use crate::model::Window;
     use anyhow::anyhow;
     use chrono::TimeZone;
-    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn usage(pct: f64) -> Usage {
         Usage {
@@ -125,7 +135,7 @@ mod tests {
         codex: Result<Usage>,
     ) -> (Snapshot, u32) {
         let (refreshed, calls) = run_with(path, now, mode, Snapshot::default(), claude, codex);
-        assert!(refreshed.save_error.is_none());
+        assert!(refreshed.cache_error.is_none());
         (refreshed.snapshot, calls)
     }
 
@@ -137,25 +147,23 @@ mod tests {
         claude: Result<Usage>,
         codex: Result<Usage>,
     ) -> (Refreshed, u32) {
-        let calls = Cell::new(0);
+        let calls = AtomicU32::new(0);
+        let count = || calls.fetch_add(1, Ordering::Relaxed);
         let refreshed = refresh(
             path,
             now,
             mode,
             last,
-            Fetchers {
-                claude: || {
-                    calls.set(calls.get() + 1);
-                    claude
-                },
-                codex: || {
-                    calls.set(calls.get() + 1);
-                    codex
-                },
+            || {
+                count();
+                claude
             },
-        )
-        .unwrap();
-        (refreshed, calls.get())
+            || {
+                count();
+                codex
+            },
+        );
+        (refreshed, calls.into_inner())
     }
 
     #[test]
@@ -234,7 +242,6 @@ mod tests {
         let t1 = t0() + AUTO_TTL;
         let (snap, _) = run(&path, t1, Mode::Auto, Err(anyhow!("boom")), Ok(usage(3.0)));
         assert_eq!(snap.claude.usage, Some(usage(1.0)));
-        assert_eq!(snap.claude.updated_at, Some(t0()));
         assert_eq!(snap.claude.error.as_deref(), Some("boom"));
         assert_eq!(snap.codex.error, None);
         assert_eq!(snap.attempted_at, Some(t1));
@@ -242,7 +249,6 @@ mod tests {
         let t2 = t1 + AUTO_TTL;
         let (snap, _) = run(&path, t2, Mode::Auto, Ok(usage(4.0)), Ok(usage(4.0)));
         assert_eq!(snap.claude.usage, Some(usage(4.0)));
-        assert_eq!(snap.claude.updated_at, Some(t2));
         assert_eq!(snap.claude.error, None);
     }
 
@@ -272,7 +278,7 @@ mod tests {
             Ok(usage(2.0)),
         );
         assert_eq!(calls, 2);
-        assert!(refreshed.save_error.is_some());
+        assert!(refreshed.cache_error.is_some());
         let snap = refreshed.snapshot;
         assert_eq!(snap.claude.usage, Some(usage(1.0)));
         assert_eq!(snap.codex.usage, Some(usage(2.0)));
@@ -309,5 +315,26 @@ mod tests {
         );
         assert_eq!(calls, 0);
         assert_eq!(refreshed.snapshot.claude.usage, Some(usage(2.0)));
+    }
+
+    #[test]
+    fn lock_failure_still_fetches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        // A directory in the lock file's place makes locking fail.
+        fs::create_dir(path.with_extension("lock")).unwrap();
+
+        let (refreshed, calls) = run_with(
+            &path,
+            t0(),
+            Mode::Auto,
+            Snapshot::default(),
+            Ok(usage(1.0)),
+            Ok(usage(2.0)),
+        );
+        assert_eq!(calls, 2);
+        assert!(refreshed.cache_error.is_some());
+        assert_eq!(refreshed.snapshot.claude.usage, Some(usage(1.0)));
+        assert!(!path.exists());
     }
 }

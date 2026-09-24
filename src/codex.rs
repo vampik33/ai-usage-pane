@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::model::{Usage, Window};
@@ -37,8 +37,8 @@ struct RateLimit {
 struct RawWindow {
     used_percent: f64,
     limit_window_seconds: u64,
-    /// Unix seconds.
-    reset_at: i64,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    reset_at: DateTime<Utc>,
 }
 
 pub fn parse(body: &str) -> Result<Usage> {
@@ -51,7 +51,7 @@ pub fn parse(body: &str) -> Result<Usage> {
     {
         let window = Window {
             used_percent: w.used_percent,
-            resets_at: DateTime::from_timestamp(w.reset_at, 0),
+            resets_at: Some(w.reset_at),
         };
         match w.limit_window_seconds {
             FIVE_HOURS_SECS => usage.five_hour = Some(window),

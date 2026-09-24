@@ -2,12 +2,10 @@ use chrono::Duration;
 
 /// Time until reset: `now`, `<1m`, `45m`, `1h07m`, `3d14h`.
 pub fn countdown(d: Duration) -> String {
-    let secs = d.num_seconds();
-    if secs <= 0 {
+    if d.num_seconds() <= 0 {
         return "now".into();
     }
-    let (days, hours, mins) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
-    match (days, hours, mins) {
+    match (d.num_days(), d.num_hours() % 24, d.num_minutes() % 60) {
         (0, 0, 0) => "<1m".into(),
         (0, 0, m) => format!("{m}m"),
         (0, h, m) => format!("{h}h{m:02}m"),

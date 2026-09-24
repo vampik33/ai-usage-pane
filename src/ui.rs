@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::cache::{self, Fetchers, Mode, Refreshed};
+use crate::cache::{self, Mode, Refreshed};
 use crate::format::{ago, bar, countdown};
 use crate::model::{ProviderState, Snapshot, Window};
 use crate::{claude, codex};
@@ -48,8 +48,8 @@ struct App {
     cache_error: Option<String>,
     /// Where the refresh button was last drawn, for mouse hit-testing.
     button: Rect,
-    tx: Sender<Result<Refreshed>>,
-    rx: Receiver<Result<Refreshed>>,
+    tx: Sender<Refreshed>,
+    rx: Receiver<Refreshed>,
 }
 
 impl App {
@@ -91,15 +91,10 @@ impl App {
                     _ => {}
                 }
             }
-            while let Ok(result) = self.rx.try_recv() {
+            while let Ok(refreshed) = self.rx.try_recv() {
                 self.refreshing = false;
-                match result {
-                    Ok(refreshed) => {
-                        self.snapshot = refreshed.snapshot;
-                        self.cache_error = refreshed.save_error.map(|e| format!("{e:#}"));
-                    }
-                    Err(e) => self.cache_error = Some(format!("{e:#}")),
-                }
+                self.snapshot = refreshed.snapshot;
+                self.cache_error = refreshed.cache_error.map(|e| format!("{e:#}"));
             }
             if self.last_check.elapsed() >= CHECK_EVERY {
                 self.spawn_refresh(Mode::Auto);
@@ -124,10 +119,8 @@ impl App {
                 now,
                 mode,
                 last,
-                Fetchers {
-                    claude: || claude::fetch(&home, now),
-                    codex: || codex::fetch(&home),
-                },
+                || claude::fetch(&home, now),
+                || codex::fetch(&home),
             );
             let _ = tx.send(result);
         });
@@ -176,25 +169,20 @@ impl App {
 
 fn provider_line(name: &str, state: &ProviderState, now: DateTime<Utc>) -> Line<'static> {
     let mut spans = vec![Span::raw(format!("{name:<7}")).bold()];
-    match &state.usage {
-        Some(u) => {
+    let error = |prefix: &str, e: &String| {
+        Span::styled(format!("{prefix}⚠ {e}"), Style::new().fg(Color::Red))
+    };
+    match (&state.usage, &state.error) {
+        (Some(u), e) => {
             spans.extend(window_spans("5h", u.five_hour.as_ref(), now));
             spans.push(Span::raw(" │ ").dim());
             spans.extend(window_spans("wk", u.weekly.as_ref(), now));
+            if let Some(e) = e {
+                spans.push(error("  stale: ", e));
+            }
         }
-        None if state.error.is_none() => spans.push(Span::raw("loading…").dim()),
-        None => {}
-    }
-    if let Some(e) = &state.error {
-        let prefix = if state.usage.is_some() {
-            "  stale: "
-        } else {
-            ""
-        };
-        spans.push(Span::styled(
-            format!("{prefix}⚠ {e}"),
-            Style::new().fg(Color::Red),
-        ));
+        (None, None) => spans.push(Span::raw("loading…").dim()),
+        (None, Some(e)) => spans.push(error("", e)),
     }
     Line::from(spans)
 }
@@ -205,22 +193,14 @@ fn window_spans(label: &str, window: Option<&Window>, now: DateTime<Utc>) -> Vec
         spans.push(Span::raw("—").dim());
         return spans;
     };
-    // Past the reset time the percentage is outdated until the next fetch.
-    let expired = w.resets_at.is_some_and(|t| t <= now);
-    let style = if expired {
-        Style::new().dim()
-    } else {
-        Style::new().fg(level_color(w.used_percent))
-    };
-    let percent = if expired {
-        "   —".to_string()
-    } else {
-        format!("{:>3.0}%", w.used_percent)
-    };
-    let reset = match w.resets_at {
-        None => "—".to_string(),
-        Some(_) if expired => "reset".to_string(),
-        Some(t) => countdown(t - now),
+    let (style, percent, reset) = match w.resets_at {
+        // Past the reset time the percentage is outdated until the next fetch.
+        Some(t) if t <= now => (Style::new().dim(), "   —".to_string(), "reset".to_string()),
+        resets_at => (
+            Style::new().fg(level_color(w.used_percent)),
+            format!("{:>3.0}%", w.used_percent),
+            resets_at.map_or("—".to_string(), |t| countdown(t - now)),
+        ),
     };
     spans.push(Span::styled(bar(w.used_percent, BAR_WIDTH), style));
     spans.push(Span::styled(format!(" {percent}"), style));
