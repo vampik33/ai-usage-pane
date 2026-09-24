@@ -25,15 +25,25 @@ pub struct Fetchers<C, X> {
     pub codex: X,
 }
 
+pub struct Refreshed {
+    pub snapshot: Snapshot,
+    /// Writing the cache failed; `snapshot` is still current, just not shared.
+    pub save_error: Option<anyhow::Error>,
+}
+
 /// Returns the cached snapshot, fetching first if it is older than the
 /// mode's threshold. An exclusive lock serialises concurrent panes, so the
 /// ones that wait pick up the snapshot the first one just wrote.
+///
+/// `last` is the caller's in-memory snapshot. It is used when newer than the
+/// cache, so a pane that cannot write the cache still throttles its fetches.
 pub fn refresh<C, X>(
     path: &Path,
     now: DateTime<Utc>,
     mode: Mode,
+    last: Snapshot,
     fetchers: Fetchers<C, X>,
-) -> Result<Snapshot>
+) -> Result<Refreshed>
 where
     C: FnOnce() -> Result<Usage>,
     X: FnOnce() -> Result<Usage>,
@@ -45,27 +55,42 @@ where
     lock.lock().context("lock cache")?;
 
     // A missing or corrupt cache just means "fetch now".
-    let mut snap: Snapshot = fs::read_to_string(path)
+    let cached: Snapshot = fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    let mut snap = if last.attempted_at > cached.attempted_at {
+        last
+    } else {
+        cached
+    };
 
     let min_age = match mode {
         Mode::Auto => AUTO_TTL,
         Mode::Manual => MANUAL_FLOOR,
     };
     if snap.attempted_at.is_some_and(|t| now - t < min_age) {
-        return Ok(snap);
+        return Ok(Refreshed {
+            snapshot: snap,
+            save_error: None,
+        });
     }
 
     snap.claude.apply((fetchers.claude)(), now);
     snap.codex.apply((fetchers.codex)(), now);
     snap.attempted_at = Some(now);
 
+    Ok(Refreshed {
+        save_error: save(path, &snap).err(),
+        snapshot: snap,
+    })
+}
+
+fn save(path: &Path, snap: &Snapshot) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(&snap)?).context("write cache")?;
+    fs::write(&tmp, serde_json::to_string_pretty(snap)?).context("write cache")?;
     fs::rename(&tmp, path).context("replace cache")?;
-    Ok(snap)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -99,11 +124,25 @@ mod tests {
         claude: Result<Usage>,
         codex: Result<Usage>,
     ) -> (Snapshot, u32) {
+        let (refreshed, calls) = run_with(path, now, mode, Snapshot::default(), claude, codex);
+        assert!(refreshed.save_error.is_none());
+        (refreshed.snapshot, calls)
+    }
+
+    fn run_with(
+        path: &Path,
+        now: DateTime<Utc>,
+        mode: Mode,
+        last: Snapshot,
+        claude: Result<Usage>,
+        codex: Result<Usage>,
+    ) -> (Refreshed, u32) {
         let calls = Cell::new(0);
-        let snap = refresh(
+        let refreshed = refresh(
             path,
             now,
             mode,
+            last,
             Fetchers {
                 claude: || {
                     calls.set(calls.get() + 1);
@@ -116,7 +155,7 @@ mod tests {
             },
         )
         .unwrap();
-        (snap, calls.get())
+        (refreshed, calls.get())
     }
 
     #[test]
@@ -215,5 +254,60 @@ mod tests {
         let (snap, calls) = run(&path, t0(), Mode::Auto, Ok(usage(5.0)), Ok(usage(5.0)));
         assert_eq!(calls, 2);
         assert_eq!(snap.claude.usage, Some(usage(5.0)));
+    }
+
+    #[test]
+    fn save_failure_keeps_fetched_usage_and_throttles_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        // A directory in the temp file's place makes the write fail.
+        fs::create_dir(path.with_extension("tmp")).unwrap();
+
+        let (refreshed, calls) = run_with(
+            &path,
+            t0(),
+            Mode::Auto,
+            Snapshot::default(),
+            Ok(usage(1.0)),
+            Ok(usage(2.0)),
+        );
+        assert_eq!(calls, 2);
+        assert!(refreshed.save_error.is_some());
+        let snap = refreshed.snapshot;
+        assert_eq!(snap.claude.usage, Some(usage(1.0)));
+        assert_eq!(snap.codex.usage, Some(usage(2.0)));
+        assert_eq!(snap.attempted_at, Some(t0()));
+
+        let (refreshed, calls) = run_with(
+            &path,
+            t0() + MANUAL_FLOOR - Duration::seconds(1),
+            Mode::Manual,
+            snap,
+            Ok(usage(3.0)),
+            Ok(usage(3.0)),
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(refreshed.snapshot.claude.usage, Some(usage(1.0)));
+    }
+
+    #[test]
+    fn newer_cache_wins_over_older_in_memory_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        let (old, _) = run(&path, t0(), Mode::Auto, Ok(usage(1.0)), Ok(usage(1.0)));
+        // Another pane fetched later.
+        let t1 = t0() + AUTO_TTL;
+        run(&path, t1, Mode::Auto, Ok(usage(2.0)), Ok(usage(2.0)));
+
+        let (refreshed, calls) = run_with(
+            &path,
+            t1 + Duration::seconds(1),
+            Mode::Auto,
+            old,
+            Ok(usage(3.0)),
+            Ok(usage(3.0)),
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(refreshed.snapshot.claude.usage, Some(usage(2.0)));
     }
 }

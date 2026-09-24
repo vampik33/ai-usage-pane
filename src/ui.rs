@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::cache::{self, Fetchers, Mode};
+use crate::cache::{self, Fetchers, Mode, Refreshed};
 use crate::format::{ago, bar, countdown};
 use crate::model::{ProviderState, Snapshot, Window};
 use crate::{claude, codex};
@@ -48,8 +48,8 @@ struct App {
     cache_error: Option<String>,
     /// Where the refresh button was last drawn, for mouse hit-testing.
     button: Rect,
-    tx: Sender<Result<Snapshot>>,
-    rx: Receiver<Result<Snapshot>>,
+    tx: Sender<Result<Refreshed>>,
+    rx: Receiver<Result<Refreshed>>,
 }
 
 impl App {
@@ -94,9 +94,9 @@ impl App {
             while let Ok(result) = self.rx.try_recv() {
                 self.refreshing = false;
                 match result {
-                    Ok(snapshot) => {
-                        self.snapshot = snapshot;
-                        self.cache_error = None;
+                    Ok(refreshed) => {
+                        self.snapshot = refreshed.snapshot;
+                        self.cache_error = refreshed.save_error.map(|e| format!("{e:#}"));
                     }
                     Err(e) => self.cache_error = Some(format!("{e:#}")),
                 }
@@ -116,12 +116,14 @@ impl App {
         self.refreshing = true;
         self.last_check = Instant::now();
         let (tx, home, path) = (self.tx.clone(), self.home.clone(), self.cache_path.clone());
+        let last = self.snapshot.clone();
         thread::spawn(move || {
             let now = Utc::now();
             let result = cache::refresh(
                 &path,
                 now,
                 mode,
+                last,
                 Fetchers {
                     claude: || claude::fetch(&home, now),
                     codex: || codex::fetch(&home),
