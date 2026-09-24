@@ -31,28 +31,15 @@ cargo install --git https://github.com/vampik33/ai-usage-pane
 
 ## Warp setup
 
-Save as `~/.local/share/warp-terminal/tab_configs/ai_usage.toml` (Linux), then pick
-it from the **+** menu (hover → **Make default** to use it for every new tab):
+Warp restores each pane's size and working directory after a restart, but not the
+command running in it. So the pane is tied to a marker directory, and a fish hook
+starts the app when a shell arrives there:
 
-```toml
-name = "AI usage"
-
-[[panes]]
-id = "root"
-split = "vertical"
-children = ["main", "usage"]
-
-[[panes]]
-id = "main"
-type = "terminal"
-is_focused = true
-
-[[panes]]
-id = "usage"
-type = "terminal"
-commands = ["ai-usage-pane"]
-
-[params]
+```sh
+mkdir -p ~/.local/share/ai-usage-pane
+cp contrib/ai-usage-pane.fish ~/.config/fish/conf.d/
 ```
 
-Warp splits panes equally, so drag the divider down until the usage pane is ~3 lines tall.
+Then in any tab, split the pane down and run `aiu` in the new pane. Resize it to
+~3 lines; Warp remembers the size across restarts and the hook restarts the app.
+Quitting with `q` leaves a normal prompt; run `aiu` again to bring it back.
